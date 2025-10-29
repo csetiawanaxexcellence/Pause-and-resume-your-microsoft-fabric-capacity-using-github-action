@@ -1,0 +1,297 @@
+name: Fabric Capacity Manager
+
+on:
+  # Scheduled trigger using cron (UTC timezone)
+  # Runs every day at 0:15 AM UTC+8 (Singapore time) = 16:15 UTC previous day
+  schedule:
+    - cron: '15 16 * * *'  # Every day at 0:15 AM UTC+8 (Singapore time)
+    # More examples:
+    # - cron: '0 0 * * *'      # Daily at midnight UTC
+    # - cron: '0 2 * * *'      # Daily at 2:00 AM UTC
+    # - cron: '0 */6 * * *'    # Every 6 hours
+    # - cron: '0 9 * * 1-5'    # Weekdays at 9 AM UTC
+  
+  # Allow manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'pause-resume'
+        type: choice
+        options:
+          - pause-resume
+          - pause
+          - resume
+          - status
+      capacity_name:
+        description: 'Capacity name (optional, uses secret if not provided)'
+        required: false
+        default: ''
+        type: string
+
+env:
+  SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+  CAPACITY_NAME: ${{ github.event.inputs.capacity_name || secrets.AZURE_CAPACITY_NAME }}
+  TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  SERVICE_PRINCIPAL: ${{ secrets.AZURE_CLIENT_ID }}
+  SERVICE_PRINCIPAL_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+jobs:
+  manage-capacity:
+    runs-on: ubuntu-latest
+    name: Manage Fabric Capacity
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install jq (for JSON parsing)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+      
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+      
+      - name: Set subscription
+        run: |
+          az account set --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+          echo "✅ Set subscription to: ${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+      
+      - name: Get Azure Access Token
+        id: get_token
+        run: |
+          echo "🔐 Getting Azure access token..."
+          TOKEN=$(az account get-access-token --resource https://management.azure.com --query accessToken -o tsv)
+          echo "✅ Token obtained"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+      
+      - name: Check capacity status
+        id: check_status
+        run: |
+          echo "🔍 Checking capacity status..."
+          RESPONSE=$(curl -s -X GET \
+            -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            "https://management.azure.com/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ secrets.AZURE_RESOURCE_GROUP }}/providers/Microsoft.Fabric/capacities/${{ env.CAPACITY_NAME }}?api-version=2023-11-01")
+          
+          STATE=$(echo "$RESPONSE" | jq -r '.properties.state // empty')
+          
+          if [ -z "$STATE" ]; then
+            echo "❌ Error: Failed to get capacity status"
+            echo "Response: $RESPONSE"
+            exit 1
+          fi
+          
+          echo "Current state: $STATE"
+          echo "state=$STATE" >> $GITHUB_OUTPUT
+      
+      - name: Determine action
+        id: determine_action
+        run: |
+          ACTION="${{ github.event.inputs.action || 'pause-resume' }}"
+          echo "action=$ACTION" >> $GITHUB_OUTPUT
+      
+      - name: Pause capacity (if needed)
+        if: |
+          (steps.determine_action.outputs.action == 'pause-resume' && steps.check_status.outputs.state == 'Active') ||
+          steps.determine_action.outputs.action == 'pause'
+        run: |
+          echo "⏸️  Pausing capacity: ${{ env.CAPACITY_NAME }}"
+          
+          # Check current state
+          CURRENT_RESPONSE=$(curl -s -X GET \
+            -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            "https://management.azure.com/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ secrets.AZURE_RESOURCE_GROUP }}/providers/Microsoft.Fabric/capacities/${{ env.CAPACITY_NAME }}?api-version=2023-11-01")
+          
+          CURRENT_STATE=$(echo "$CURRENT_RESPONSE" | jq -r '.properties.state // empty')
+          
+          if [ "$CURRENT_STATE" == "Paused" ]; then
+            echo "ℹ️  Capacity is already paused, skipping"
+          else
+            echo "Initiating pause operation..."
+            
+            # Call suspend API
+            SUSPEND_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+              -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+              -H "Content-Type: application/json" \
+              -H "Content-Length: 0" \
+              "https://management.azure.com/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ secrets.AZURE_RESOURCE_GROUP }}/providers/Microsoft.Fabric/capacities/${{ env.CAPACITY_NAME }}/suspend?api-version=2023-11-01")
+            
+            HTTP_CODE=$(echo "$SUSPEND_RESPONSE" | tail -n1)
+            BODY=$(echo "$SUSPEND_RESPONSE" | sed '$d')
+            
+            if [ "$HTTP_CODE" == "200" ] || [ "$HTTP_CODE" == "202" ]; then
+              echo "✅ Pause operation initiated (HTTP $HTTP_CODE)"
+              echo "⏳ Waiting for pause operation to complete (max 5 minutes)..."
+              
+              # Get operation URL if provided
+              OPERATION_URL=$(echo "$BODY" | jq -r '.properties.operationUrl // empty')
+              
+              # Wait for capacity to be paused
+              MAX_WAIT=300
+              ELAPSED=0
+              INTERVAL=10
+              
+              while [ $ELAPSED -lt $MAX_WAIT ]; do
+                sleep $INTERVAL
+                ELAPSED=$((ELAPSED + INTERVAL))
+                
+                STATUS_RESPONSE=$(curl -s -X GET \
+                  -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+                  -H "Content-Type: application/json" \
+                  "https://management.azure.com/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ secrets.AZURE_RESOURCE_GROUP }}/providers/Microsoft.Fabric/capacities/${{ env.CAPACITY_NAME }}?api-version=2023-11-01")
+                
+                STATE=$(echo "$STATUS_RESPONSE" | jq -r '.properties.state // empty' | tr '[:upper:]' '[:lower:]')
+                
+                echo "   Status: $STATE (elapsed: ${ELAPSED}s)"
+                
+                if [ "$STATE" == "paused" ]; then
+                  echo "✅ Capacity paused successfully!"
+                  break
+                fi
+              done
+              
+              if [ $ELAPSED -ge $MAX_WAIT ]; then
+                echo "⚠️  Timeout waiting for pause operation"
+              fi
+            else
+              echo "❌ Failed to pause capacity: HTTP $HTTP_CODE"
+              echo "Response: $BODY"
+              exit 1
+            fi
+          fi
+      
+      - name: Wait 45 seconds
+        if: steps.determine_action.outputs.action == 'pause-resume'
+        run: |
+          echo "⏳ Waiting 45 seconds..."
+          sleep 45
+      
+      - name: Resume capacity (if needed)
+        if: |
+          (steps.determine_action.outputs.action == 'pause-resume') ||
+          steps.determine_action.outputs.action == 'resume'
+        run: |
+          echo "▶️  Resuming capacity: ${{ env.CAPACITY_NAME }}"
+          
+          # Check current state
+          CURRENT_RESPONSE=$(curl -s -X GET \
+            -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            "https://management.azure.com/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ secrets.AZURE_RESOURCE_GROUP }}/providers/Microsoft.Fabric/capacities/${{ env.CAPACITY_NAME }}?api-version=2023-11-01")
+          
+          CURRENT_STATE=$(echo "$CURRENT_RESPONSE" | jq -r '.properties.state // empty')
+          
+          if [ "$CURRENT_STATE" == "Active" ]; then
+            echo "ℹ️  Capacity is already active, skipping"
+          else
+            echo "Initiating resume operation..."
+            
+            # Call resume API
+            RESUME_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+              -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+              -H "Content-Type: application/json" \
+              -H "Content-Length: 0" \
+              "https://management.azure.com/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ secrets.AZURE_RESOURCE_GROUP }}/providers/Microsoft.Fabric/capacities/${{ env.CAPACITY_NAME }}/resume?api-version=2023-11-01")
+            
+            HTTP_CODE=$(echo "$RESUME_RESPONSE" | tail -n1)
+            BODY=$(echo "$RESUME_RESPONSE" | sed '$d')
+            
+            if [ "$HTTP_CODE" == "200" ] || [ "$HTTP_CODE" == "202" ]; then
+              echo "✅ Resume operation initiated (HTTP $HTTP_CODE)"
+              echo "⏳ Waiting for resume operation to complete (max 5 minutes)..."
+              
+              # Get operation URL if provided
+              OPERATION_URL=$(echo "$BODY" | jq -r '.properties.operationUrl // empty')
+              
+              # Wait for capacity to be active
+              MAX_WAIT=300
+              ELAPSED=0
+              INTERVAL=10
+              
+              while [ $ELAPSED -lt $MAX_WAIT ]; do
+                sleep $INTERVAL
+                ELAPSED=$((ELAPSED + INTERVAL))
+                
+                STATUS_RESPONSE=$(curl -s -X GET \
+                  -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+                  -H "Content-Type: application/json" \
+                  "https://management.azure.com/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ secrets.AZURE_RESOURCE_GROUP }}/providers/Microsoft.Fabric/capacities/${{ env.CAPACITY_NAME }}?api-version=2023-11-01")
+                
+                STATE=$(echo "$STATUS_RESPONSE" | jq -r '.properties.state // empty' | tr '[:upper:]' '[:lower:]')
+                
+                echo "   Status: $STATE (elapsed: ${ELAPSED}s)"
+                
+                if [ "$STATE" == "active" ]; then
+                  echo "✅ Capacity resumed successfully!"
+                  break
+                fi
+              done
+              
+              if [ $ELAPSED -ge $MAX_WAIT ]; then
+                echo "⚠️  Timeout waiting for resume operation"
+              fi
+            else
+              echo "❌ Failed to resume capacity: HTTP $HTTP_CODE"
+              echo "Response: $BODY"
+              exit 1
+            fi
+          fi
+      
+      - name: Wait 45 seconds (before final check)
+        if: steps.determine_action.outputs.action == 'pause-resume'
+        run: |
+          echo "⏳ Waiting 45 seconds before final check..."
+          sleep 45
+      
+      - name: Final status check
+        if: steps.determine_action.outputs.action == 'pause-resume' || steps.determine_action.outputs.action == 'status'
+        run: |
+          echo "📊 Final capacity status:"
+          
+          FINAL_RESPONSE=$(curl -s -X GET \
+            -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            "https://management.azure.com/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ secrets.AZURE_RESOURCE_GROUP }}/providers/Microsoft.Fabric/capacities/${{ env.CAPACITY_NAME }}?api-version=2023-11-01")
+          
+          CAPACITY_NAME=$(echo "$FINAL_RESPONSE" | jq -r '.name // empty')
+          FINAL_STATE=$(echo "$FINAL_RESPONSE" | jq -r '.properties.state // empty')
+          LOCATION=$(echo "$FINAL_RESPONSE" | jq -r '.location // empty')
+          SKU_NAME=$(echo "$FINAL_RESPONSE" | jq -r '.sku.name // empty')
+          
+          echo "Name: $CAPACITY_NAME"
+          echo "State: $FINAL_STATE"
+          echo "Location: $LOCATION"
+          echo "SKU: $SKU_NAME"
+          echo "✅ Final state: $FINAL_STATE"
+          
+          if [ "$FINAL_STATE" != "Active" ] && [ "${{ steps.determine_action.outputs.action }}" == "pause-resume" ]; then
+            echo "⚠️  Warning: Capacity is not in Active state after resume operation"
+            exit 1
+          fi
+      
+      - name: Summary
+        if: always()
+        run: |
+          echo "========================================="
+          echo "🏗️  FABRIC CAPACITY MANAGEMENT SUMMARY"
+          echo "========================================="
+          echo "Capacity: ${{ env.CAPACITY_NAME }}"
+          echo "Resource Group: ${{ secrets.AZURE_RESOURCE_GROUP }}"
+          echo "Subscription: ${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+          echo "Action: ${{ steps.determine_action.outputs.action }}"
+          echo "Workflow Run: ${{ github.run_id }}"
+          echo "========================================="
+
