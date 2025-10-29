@@ -1,6 +1,6 @@
-# Pause-and-resume-your-microsoft-fabric-capacity-using-github-action
+# Schedule Pause and resume your Microsoft Fabric Capacity Using Github Action For FREE
 
-Pause and resume your microsoft fabric capacity for free using github action
+Schedule Pause and resume your microsoft fabric capacity for free using github action
 
 ## 📖 About
 
