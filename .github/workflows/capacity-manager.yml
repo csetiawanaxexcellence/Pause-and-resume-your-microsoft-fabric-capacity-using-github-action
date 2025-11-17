@@ -3,8 +3,8 @@ name: Fabric Capacity Manager
 on:
   # Scheduled trigger using cron (UTC timezone)
   # Runs every day at 0:15 AM UTC+8 (Singapore time) = 16:15 UTC previous day
-  schedule:
-    - cron: '15 16 * * *'  # Every day at 0:15 AM UTC+8 (Singapore time)
+  # schedule:
+    # - cron: '15 16 * * *'  # Every day at 0:15 AM UTC+8 (Singapore time)
     # More examples:
     # - cron: '0 0 * * *'      # Daily at midnight UTC
     # - cron: '0 2 * * *'      # Daily at 2:00 AM UTC
